@@ -1,0 +1,64 @@
+[tool.poetry]
+name = "cbcbase"
+description = "Couchbase Connect Base"
+version = "1.0.0"
+readme = "README.md"
+authors = ["Michael Minichino <info@unix.us.com>"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "License :: OSI Approved :: Apache Software License",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+keywords = ["couchbase", "automation"]
+packages = [
+    { include = "cbcbase" }
+]
+
+[tool.poetry.urls]
+"Homepage" = "https://github.com/mminichino/cb-base"
+
+[tool.poetry.dependencies]
+python = ">=3.8,<4"
+attrs = ">=23.1.0"
+restfull = ">=1.0.5"
+pytoolbase = ">=1.0.1"
+couchbase = ">=4.2.1"
+dnspython = ">=2.3.0"
+
+[tool.poetry.group.test.dependencies]
+pytest = ">=8.2.2"
+pytest-asyncio = "^0.21.1"
+pytest-rerunfailures = "^12.0"
+pytest-order = "^1.2.1"
+
+[tool.poetry.group.dev.dependencies]
+bumpversion = "^0.6.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+addopts = "-rE --no-header -v -p no:warnings"
+log_file = "pytest.log"
+log_file_level = "DEBUG"
+pythonpath = [
+    ".",
+    "tests"
+]
+testpaths = [
+    "tests",
+]
+python_classes = [
+    "Test*"
+]
+python_files = [
+    "test_[0-9]*.py"
+]
+markers = []
