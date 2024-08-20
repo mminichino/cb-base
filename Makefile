@@ -10,13 +10,17 @@ minor:
 		bumpversion --allow-dirty minor
 major:
 		bumpversion --allow-dirty major
-push:
+pypi:
+		poetry build
+		poetry publish
+build:
+		poetry build
+publish:
 		poetry publish
 download:
 		gh release create -R "mminichino/$(PROJECT_NAME)" \
 		-t "Release $(PROJECT_VERSION)" \
 		-n "Release $(PROJECT_VERSION)" \
 		$(PROJECT_VERSION)
-pypi: push
 test:
 		python -m pytest tests/test_1.py
