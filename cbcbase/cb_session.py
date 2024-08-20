@@ -1,65 +1,32 @@
 ##
 ##
 
-from cbcbase.exceptions import FatalError
-from pytoolbase.retry import retry
-from restfull.restapi import RestAPI
-from restfull.basic_auth import BasicAuth
-from cbcbase.logic.key_styles import KeyStyle
+import time
+import hashlib
 import logging
-import socket
-import dns.resolver
-import uuid
-from typing import Union
-from enum import Enum
 from datetime import timedelta
+from typing import List
 from couchbase.auth import PasswordAuthenticator
-from couchbase.options import ClusterTimeoutOptions, LockMode, ClusterOptions, TLSVerifyMode
-from couchbase.cluster import Cluster
-from acouchbase.cluster import AsyncCluster
-from couchbase.diagnostics import ServiceType, PingState
+from couchbase.bucket import Bucket
+from couchbase.diagnostics import PingState
+from couchbase.exceptions import BucketAlreadyExistsException, ScopeAlreadyExistsException, CollectionAlreadyExistsException
+from couchbase.logic.n1ql import QueryScanConsistency
+from couchbase.management.buckets import BucketManager, CreateBucketSettings
+from couchbase.management.collections import CollectionSpec
+from couchbase.management.options import CreatePrimaryQueryIndexOptions
+from couchbase.management.logic.buckets_logic import BucketType, StorageBackend, EvictionPolicyType, CompressionMode, ConflictResolutionType
+from couchbase.options import ClusterTimeoutOptions, ClusterOptions, TLSVerifyMode, AnalyticsOptions
+from couchbase.cluster import Cluster, QueryOptions
+from pytoolbase.retry import retry
+from cbcbase.logic.cb_index import CBQueryIndex
 
-logger = logging.getLogger('cbcbase.session')
+logger = logging.getLogger('cbcbase.logic.cb_session')
 logger.addHandler(logging.NullHandler())
-
-
-class DNSLookupTimeout(FatalError):
-    pass
-
-
-class NodeUnreachable(FatalError):
-    pass
-
-
-class NodeConnectionTimeout(FatalError):
-    pass
-
-
-class NodeConnectionError(FatalError):
-    pass
-
-
-class NodeConnectionFailed(FatalError):
-    pass
-
-
-class ClusterHealthCheckError(FatalError):
-    pass
-
-
-class KeyFormatError(FatalError):
-    pass
-
-
-class BucketMode(Enum):
-    DEFAULT = 0
-    CACHE = 1
-    CAPACITY = 2
 
 
 class CBSession(object):
 
-    def __init__(self, hostname: str, username: str, password: str, ssl=True, project=None, database=None, external=False, kv_timeout: int = 5, query_timeout: int = 60):
+    def __init__(self, hostname: str, username: str, password: str, ssl=True, kv_timeout: int = 5, query_timeout: int = 60):
         self.cluster_node_count = None
         self._cluster = None
         self._bucket = None
@@ -68,37 +35,13 @@ class CBSession(object):
         self._bucket_name = None
         self._scope_name = "_default"
         self._collection_name = "_default"
+        self.ssl = ssl
         self.kv_timeout = kv_timeout
         self.query_timeout = query_timeout
         self.hostname = hostname
         self.username = username
         self.password = password
-        self.capella_project = project
-        self.capella_db = database
-        if self.capella_db:
-            self.ssl = True
-        else:
-            self.ssl = ssl
-        self.rally_host_name = hostname
-        self.rally_cluster_node = self.rally_host_name
-        self.rally_dns_domain = False
-        self.use_external_network = external
-        self.external_network_present = False
-        self.node_list = []
-        self.external_list = []
-        self.srv_host_list = []
-        self.all_hosts = []
-        self.node_cycle = None
-        self.cluster_info = None
-        self.sw_version = None
-        self.os_platform = None
-        self.memory_quota = None
-        self.cluster_services = []
-        self.memory_quota = 0
-        self.index_memory_quota = 0
-        self.fts_memory_quota = 0
-        self.cbas_memory_quota = 0
-        self.eventing_memory_quota = 0
+
         self.auth = PasswordAuthenticator(self.username, self.password)
         self.timeouts = ClusterTimeoutOptions(query_timeout=timedelta(seconds=query_timeout),
                                               kv_timeout=timedelta(seconds=kv_timeout),
@@ -120,249 +63,234 @@ class CBSession(object):
             self.admin_port = 8091
             self.node_port = 9102
 
-        self.is_reachable()
-        self.check_cluster()
-
         self.cluster_options = ClusterOptions(self.auth,
                                               timeout_options=self.timeouts,
-                                              tls_verify=TLSVerifyMode.NO_VERIFY,
-                                              lockmode=LockMode.WAIT)
-
-        if self.use_external_network:
-            self.cluster_options.update(network="external")
-        else:
-            self.cluster_options.update(network="default")
-
-    @retry()
-    def session(self) -> Cluster:
-        return Cluster.connect(self.cb_connect_string, self.cluster_options)
-
-    @retry()
-    async def session_a(self) -> AsyncCluster:
-        cluster = await AsyncCluster.connect(self.cb_connect_string, self.cluster_options)
-        await cluster.on_connect()
-        return cluster
-
-    @staticmethod
-    def end_session(cluster: Cluster) -> None:
-        cluster.close()
-
-    @staticmethod
-    async def end_session_a(cluster: AsyncCluster) -> None:
-        await cluster.close()
-
-    def construct_key(self, key):
-        if type(key) is int or str(key).isdigit():
-            if self._collection.name != "_default":
-                return self._collection.name + ':' + str(key)
-            else:
-                return self._bucket.name + ':' + str(key)
-        else:
-            return key
-
-    @property
-    def keyspace(self):
-        if self._scope_name != "_default" or self._collection_name != "_default":
-            return f"{self._bucket.name}.{self._scope_name}.{self._collection_name}"
-        else:
-            return self._bucket.name
-
-    @property
-    def collection_name(self):
-        if self._collection_name == "_default":
-            return self._bucket.name
-        else:
-            return self._collection_name
+                                              enable_tls=self.ssl,
+                                              tls_verify=TLSVerifyMode.NO_VERIFY)
 
     @property
     def cb_connect_string(self):
-        connect_string = self.cb_prefix + self.rally_host_name
+        connect_string = self.cb_prefix + self.hostname
         logger.debug(f"Connect string: {connect_string}")
         return connect_string
 
-    @retry(retry_count=7)
-    def is_reachable(self):
-        resolver = dns.resolver.Resolver()
-        resolver.timeout = 5
-        resolver.lifetime = 10
+    @property
+    def keyspace(self):
+        return f"{self._bucket_name}.{self._scope_name}.{self._collection_name}"
 
-        logger.debug(f"checking if rally node is reachable: {self.rally_host_name}")
+    def session(self):
+        self._cluster = Cluster.connect(self.cb_connect_string, self.cluster_options)
+        self._cluster.wait_until_ready(timedelta(seconds=5))
+        return self
+
+    def disconnect(self):
+        self._bucket = None
+        self._scope = None
+        self._collection = None
+        self._bucket_name = None
+        self._scope_name = "_default"
+        self._collection_name = "_default"
+        if self._cluster:
+            self._cluster.close()
+        self._cluster = None
+
+    def connect_bucket(self,
+                       bucket_name: str,
+                       create: bool = False,
+                       replicas: int = 1,
+                       ram_quota: int = 128,
+                       flush: bool = False,
+                       bucket_storage: StorageBackend = StorageBackend.COUCHSTORE,
+                       ttl: int = 0):
+        if create:
+            self.create_bucket(bucket_name, replicas, ram_quota, flush, bucket_storage, ttl)
+        self._bucket = self._cluster.bucket(bucket_name)
+        self._bucket_name = bucket_name
+        return self
+
+    def connect_scope(self, scope_name: str, create: bool = False):
+        if create:
+            self.create_scope(self._bucket_name, scope_name)
+        self._scope = self._bucket.scope(scope_name)
+        self._scope_name = scope_name
+        return self
+
+    def connect_collection(self, collection_name: str, create: bool = False):
+        if create:
+            self.create_collection(self._bucket_name, self._scope_name, collection_name)
+        self._collection = self._scope.collection(collection_name)
+        self._collection_name = collection_name
+        return self
+
+    def create_bucket(self,
+                      bucket_name: str,
+                      replicas: int = 1,
+                      ram_quota: int = 128,
+                      flush: bool = False,
+                      bucket_storage: StorageBackend = StorageBackend.COUCHSTORE,
+                      ttl: int = 0):
+        bucket_manager: BucketManager = self._cluster.buckets()
         try:
-            answer = resolver.resolve(self.srv_prefix + self.rally_host_name, "SRV")
-            for srv in answer:
-                record = {'hostname': str(srv.target).rstrip('.')}
-                host_answer = resolver.resolve(record['hostname'], 'A')
-                record['address'] = host_answer[0].address
-                self.srv_host_list.append(record)
-            self.rally_cluster_node = self.srv_host_list[0]['hostname']
-            self.rally_dns_domain = True
-        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            bucket_manager.create_bucket(CreateBucketSettings(
+                    name=bucket_name,
+                    flush_enabled=flush,
+                    replica_index=False,
+                    ram_quota_mb=ram_quota,
+                    num_replicas=replicas,
+                    bucket_type=BucketType.COUCHBASE,
+                    eviction_policy=EvictionPolicyType.VALUE_ONLY,
+                    max_ttl=ttl,
+                    compression_mode=CompressionMode.PASSIVE,
+                    conflict_resolution_type=ConflictResolutionType.SEQUENCE_NUMBER,
+                    storage_backend=bucket_storage,
+                ))
+        except BucketAlreadyExistsException:
             pass
-        except dns.exception.Timeout:
-            raise DNSLookupTimeout(f"{self.srv_prefix + self.rally_host_name} lookup timeout")
-        except Exception:
-            raise
 
-        if self.rally_dns_domain:
-            self.rally_cluster_node = self.rally_host_name = self.srv_host_list[0]['hostname']
-            logger.debug(f"Rewriting rally node as {self.rally_cluster_node}")
+    def bucket_wait_until_ready(self, bucket_name: str, retry_count: int = 30, wait: float = 0.5):
+        bucket = self._cluster.bucket(bucket_name)
+        for retry_number in range(retry_count + 1):
+            if self.bucket_check(bucket):
+                return True
+            else:
+                if retry_number == retry_count:
+                    return False
+                time.sleep(wait)
 
-        try:
-            self.check_node_connectivity(self.rally_cluster_node, self.admin_port)
-        except (NodeConnectionTimeout, NodeConnectionError, NodeConnectionFailed) as err:
-            raise NodeUnreachable(f"can not connect to node {self.rally_cluster_node}: {err}")
-
+    @staticmethod
+    def bucket_check(bucket: Bucket):
+        result = bucket.ping()
+        for endpoint, reports in result.endpoints.items():
+            for report in reports:
+                if not report.state == PingState.OK:
+                    return False
         return True
 
-    def check_cluster(self):
-        auth = BasicAuth(self.username, self.password)
-        rest = RestAPI(auth, self.rally_host_name, use_ssl=self.ssl, port=self.admin_port)
-        self.cluster_info = rest.get('/pools/default').validate().json()
-        self.process_cluster_data()
+    def drop_bucket(self, bucket_name: str):
+        bucket_manager: BucketManager = self._cluster.buckets()
+        bucket_manager.drop_bucket(bucket_name)
 
-    def process_cluster_data(self):
-        rally_ip = socket.gethostbyname(self.rally_host_name)
-
-        if not self.cluster_info:
-            logger.debug("process_cluster_data: no cluster info")
+    def create_scope(self, bucket_name: str, scope_name: str):
+        if scope_name == '_default':
             return
-
-        self.cluster_node_count = range(len(self.cluster_info['nodes']))
-        self.sw_version = self.cluster_info.get('nodes', [{}])[0].get('version')
-        self.os_platform = self.cluster_info.get('nodes', [{}])[0].get('os')
-
-        for node in self.cluster_info['nodes']:
-            node_name = node.get("configuredHostname").split(':')[0]
-            alternate_address = node.get("alternateAddresses", {}).get("external", {}).get("hostname")
-            self.node_list.append(node_name)
-            if alternate_address:
-                self.external_list.append(alternate_address)
-                external_ip = socket.gethostbyname(alternate_address)
-                if rally_ip == external_ip:
-                    logger.debug(f"external address {rally_ip} detected")
-                    self.use_external_network = True
-
-        self.memory_quota = self.cluster_info.get('memoryQuota', 0)
-        self.index_memory_quota = self.cluster_info.get('indexMemoryQuota', 0)
-        self.fts_memory_quota = self.cluster_info.get('ftsMemoryQuota', 0)
-        self.cbas_memory_quota = self.cluster_info.get('cbasMemoryQuota', 0)
-        self.eventing_memory_quota = self.cluster_info.get('eventingMemoryQuota', 0)
-
-    @retry(retry_count=7)
-    def check_node_connectivity(self, hostname, port):
+        bucket: Bucket = self._cluster.bucket(bucket_name)
+        collection_manager = bucket.collections()
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex((hostname, int(port)))
-            sock.close()
-        except socket.timeout:
-            raise NodeConnectionTimeout(f"timeout connecting to {hostname}:{port}")
-        except socket.error as err:
-            raise NodeConnectionError(f"error connecting to {hostname}:{port}: {err}")
+            collection_manager.create_scope(scope_name)
+        except ScopeAlreadyExistsException:
+            pass
 
-        if result == 0:
-            return True
-        else:
-            raise NodeConnectionFailed(f"node {hostname}:{port} unreachable")
+    def create_collection(self, bucket_name: str, scope_name: str, collection_name: str):
+        if collection_name == '_default':
+            return
+        bucket: Bucket = self._cluster.bucket(bucket_name)
+        collection_manager = bucket.collections()
+        collection_spec = CollectionSpec(collection_name, scope_name=scope_name)
+        try:
+            collection_manager.create_collection(collection_spec)
+        except CollectionAlreadyExistsException:
+            pass
+
+    def get_bucket(self, bucket_name: str):
+        return self._cluster.bucket(bucket_name)
 
     @retry()
-    def wait_until_ready(self):
-        nodes = []
-        cluster = Cluster(self.cb_connect_string, ClusterOptions(self.auth,
-                                                                 timeout_options=self.timeouts,
-                                                                 lockmode=LockMode.WAIT))
-        logger.debug(f"cluster {self.cb_connect_string} ping")
-        ping_result = cluster.ping()
-        endpoint: ServiceType
-        for endpoint, reports in ping_result.endpoints.items():
-            for report in reports:
-                remote = report.remote.split(":")[0]
-                nodes.append(remote)
-                if not report.state == PingState.OK:
-                    raise ClusterHealthCheckError(f"service {endpoint.value} not ok")
+    def create_primary_index(self, bucket_name: str, scope_name: str, collection_name: str, replicas: int = 1, deferred: bool = False, timeout: int = 60):
+        index_options = CreatePrimaryQueryIndexOptions()
+        index_options.update(deferred=deferred)
+        index_options.update(timeout=timedelta(seconds=timeout))
+        index_options.update(num_replicas=replicas)
+        index_options.update(ignore_if_exists=True)
+        index_options.update(scope_name=scope_name)
+        index_options.update(collection_name=collection_name)
 
-        node_set = set(nodes)
-        logger.debug("ping complete")
-        return list(node_set)
+        qim = self._cluster.query_indexes()
+        qim.create_primary_index(bucket_name, index_options)
 
-    def print_host_map(self):
-        if self.rally_dns_domain:
-            print("Name %s is a domain with SRV records:" % self.rally_host_name)
-            for record in self.srv_host_list:
-                print(" => %s (%s)" % (record['hostname'], record['address']))
+    @retry()
+    def create_index(self, bucket_name: str, scope_name: str, collection_name: str, fields: List[str], replicas: int = 1, deferred: bool = False, timeout: int = 60):
+        index_options = CreatePrimaryQueryIndexOptions()
+        index_options.update(deferred=deferred)
+        index_options.update(timeout=timedelta(seconds=timeout))
+        index_options.update(num_replicas=replicas)
+        index_options.update(ignore_if_exists=True)
+        index_options.update(scope_name=scope_name)
+        index_options.update(collection_name=collection_name)
 
-        print("Cluster Host List:")
-        for i, record in enumerate(self.cluster_info['nodes']):
-            if 'alternateAddresses' in record:
-                ext_host_name = record['alternateAddresses']['external']['hostname']
-                ext_port_list = record['alternateAddresses']['external']['ports']
-            else:
-                ext_host_name = None
-                ext_port_list = None
-            host_name = record['configuredHostname']
-            version = record['version']
-            ostype = record['os']
-            services = ','.join(record['services'])
-            print(" [%02d] %s" % (i + 1, host_name), end=' ')
-            if ext_host_name:
-                print("[external]> %s" % ext_host_name, end=' ')
-            if ext_port_list:
-                for key in ext_port_list:
-                    print("%s:%s" % (key, ext_port_list[key]), end=' ')
-            print("[Services] %s [version] %s [platform] %s" % (services, version, ostype))
+        field_str = ','.join(fields)
+        hash_string = f"{bucket_name}_{scope_name}_{collection_name}_{field_str}"
+        name_part = hashlib.shake_256(hash_string.encode()).hexdigest(4)
+        index_name = f"{collection_name}_{name_part}_ix"
 
-    def get_quota_settings(self):
-        return dict(
-            data=self.memory_quota,
-            index=self.index_memory_quota,
-            fts=self.fts_memory_quota,
-            analytics=self.cbas_memory_quota,
-            eventing=self.eventing_memory_quota
-        )
+        qim = self._cluster.query_indexes()
+        qim.create_index(bucket_name, index_name, fields, index_options)
 
-    def key_format(self,
-                   style: KeyStyle,
-                   document: dict,
-                   doc_num: int = 1,
-                   id_key: str = "record_id",
-                   separator: str = "::",
-                   text: Union[str, None] = None,
-                   path: Union[str, None] = None,
-                   field: Union[str, None] = None):
-        if style.value == 0:
-            return f"{self.keyspace}{separator}{doc_num}"
-        elif style.value == 1:
-            if not document.get('type'):
-                raise KeyFormatError(f"Key style type requested: document does not have type field")
-            if document.get(id_key):
-                number = document.get(id_key)
-            else:
-                number = doc_num
-            return f"{document['type']}{separator}{number}"
-        elif style.value == 2:
-            return uuid.uuid4()
-        elif style.value == 3:
-            if not field:
-                raise KeyFormatError(f"Key field name style requested: field parameter is null")
-            return f"{field}{separator}{doc_num}"
-        elif style.value == 4:
-            return f"{self.keyspace}{separator}{doc_num}"
-        elif style.value == 5:
-            if not field:
-                raise KeyFormatError(f"Key compound name style requested: field parameter is null")
-            return f"{self.keyspace}{separator}{field}{separator}{doc_num}"
-        elif style.value == 6:
-            if not path or not text:
-                raise KeyFormatError(f"Key path style parameters not provided")
-            return f"{text}{separator}{path}"
-        elif style.value == 7:
-            if not text:
-                raise KeyFormatError(f"Key text style parameter not provided")
-            return f"{text}"
-        elif style.value == 8:
-            if not text:
-                raise KeyFormatError(f"Key text style parameter not provided")
-            number = document.get(id_key, 1)
-            return f"{text}{separator}{id_key}{separator}{number}"
+        return index_name
+
+    def index_list_all(self):
+        all_list = []
+        query_str = "SELECT * FROM system:indexes"
+        results = self.query(query_str)
+
+        for row in results:
+            for key, value in row.items():
+                entry = CBQueryIndex.from_dict(value)
+                all_list.append(entry)
+
+        return all_list
+
+    def collection_has_primary_index(self):
+        index_name = '#primary'
+        index_list = self.index_list_all()
+        for item in index_list:
+            if index_name == '#primary':
+                if (item.keyspace_id == self._collection_name or item.keyspace_id == self._bucket_name) and item.name == '#primary':
+                    return True
+            elif item.name == index_name:
+                return True
+        return False
+
+    def collection_has_index(self, index_name: str):
+        index_list = self.index_list_all()
+        for item in index_list:
+            if item.name == index_name:
+                return True
+        return False
+
+    def bucket_name(self, bucket_name: str):
+        self._bucket_name = bucket_name
+        return self
+
+    def scope_name(self, scope_name: str):
+        self._scope_name = scope_name
+        return self
+
+    def collection_name(self, collection_name: str):
+        self._collection_name = collection_name
+        return self
+
+    def get(self, doc_id: str):
+        result = self._collection.get(doc_id)
+        return result.content_as[dict]
+
+    def put(self, doc_id: str, document: dict):
+        result = self._collection.upsert(doc_id, document)
+        return result.cas
+
+    def query(self, query: str, consistent: bool = True):
+        if consistent:
+            consistency = QueryScanConsistency.REQUEST_PLUS
         else:
-            raise KeyFormatError(f"Unknown key style {style.name}")
+            consistency = QueryScanConsistency.NOT_BOUNDED
+        contents = []
+        result = self._cluster.query(query, QueryOptions(query_context=f"default:{self._bucket_name}.{self._scope_name}", scan_consistency=consistency))
+        for item in result:
+            contents.append(item)
+        return contents
+
+    def analytics_query(self, query: str):
+        contents = []
+        result = self._cluster.analytics_query(query, AnalyticsOptions(query_context=f"default:{self._bucket_name}.{self._scope_name}"))
+        for item in result:
+            contents.append(item)
+        return contents
